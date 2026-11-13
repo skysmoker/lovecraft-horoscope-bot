@@ -1,0 +1,18 @@
+# Секреты
+.env
+
+# Виртуальное окружение
+venv/
+
+# Логи и временные файлы
+bot.log
+cron.log
+pending_horoscope.txt
+sent_*.txt
+
+# Архив гороскопов
+horoscopes/
+
+# Системный мусор
+__pycache__/
+*.pyc

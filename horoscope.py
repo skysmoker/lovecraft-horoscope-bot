@@ -1,13 +1,16 @@
 import os
 import sys
+import time
+import random
+import logging
+from pathlib import Path
+from datetime import datetime
 import requests
 from openai import OpenAI
-from datetime import datetime
 from dotenv import load_dotenv
-import logging
 
-# Загружаем секреты из .env
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
 # ==================== КЛЮЧИ ====================
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
@@ -16,7 +19,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # ===============================================
 
 logging.basicConfig(
-    filename="/home/skysmoker/horoscope-bot/bot.log",
+    filename=BASE_DIR / "bot.log",
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     encoding="utf-8"
@@ -27,89 +30,169 @@ client = OpenAI(
     base_url="https://api.deepseek.com"
 )
 
-PROMPT = """Ты — писатель в стиле Говарда Лавкрафта. Напиши шутливый гороскоп на русском языке на сегодняшний день для каждого из двенадцати знаков зодиака. Для каждого знака — ровно три простых предложения. Каждое предложение — не короче 45 символов и не длиннее 60 символов. Общий объём текста для одного знака — около 320 символов и строго не более 340 символов. Формат вывода: эмодзи знака, затем название знака с заглавной буквы, точка, затем текст гороскопа. Каждый знак — с новой строки, между знаками — одна пустая строка. Стиль: страшно, жутко, обречённо, туманно и мрачно, но с юмором. Соблюдай грамотность и орфографию. Выведи только сам гороскоп, без пояснений, без служебных фраз и строго без английского текста — ни одного английского слова, ни одной латинской буквы. Не добавляй примеров и образцов — просто следуй цифрам."""
+PENDING_FILE = BASE_DIR / "pending_horoscope.txt"
+ARCHIVE_DIR = BASE_DIR / "horoscopes"
 
-PENDING_FILE = "/home/skysmoker/horoscope-bot/pending_horoscope.txt"
+DAYS_RU = [
+    "понедельник", "вторник", "среду", "четверг",
+    "пятницу", "субботу", "воскресенье"
+]
 
-def generate():
-    """Запрос к DeepSeek, сохранение в архив и в pending-файл, без отправки."""
+DAILY_THEMES = [
+    "рабочие созвоны, дедлайны и странные сообщения в рабочих чатах",
+    "деньги, импульсивные покупки и внезапные бытовые траты",
+    "дорога, пробки, навигатор и неожиданные маршруты",
+    "домашний уют, капризная техника, еда и соседи",
+    "утренний подъём, кофе, расписание и попытки всё успеть",
+    "случайные встречи, новости и общение с людьми"
+]
+
+
+def build_prompt() -> str:
+    """Формирует промпт с ориентиром по количеству слов (13-15 слов на предложение)."""
+    now = datetime.now()
+    day_name = DAYS_RU[now.weekday()]
+    theme = random.choice(DAILY_THEMES)
+
+    return (
+        f"Ты — писатель в стиле Говарда Лавкрафта. Напиши шутливый гороскоп на русском языке "
+        f"на {day_name} для каждого из двенадцати знаков зодиака. "
+        f"Используй как лёгкий фоновый мотив тему: {theme}, но не повторяй одни и те же ключевые слова "
+        "в каждом знаке — пусть у каждого знака будет своя уникальная ситуация, детали и богатая лексика. "
+        "Строгий формат для каждого из двенадцати знаков:\n"
+        "Первая строка: эмодзи знака, пробел, название знака с заглавной буквы, точка.\n"
+        "Вторая строка (сразу с новой строки, без пустой строки после заголовка): один сплошной абзац "
+        "из ровно трёх образных предложений без переносов строк внутри этого абзаца.\n"
+        "Между знаками ставь ровно одну пустую строку.\n"
+        "Строгий объём: в каждом предложении должно быть от 13 до 15 слов (примерно 40–44 слова на один знак). "
+        "Весь гороскоп из двенадцати знаков должен занять 500–530 слов (около 3700–3950 символов, но не больше 4000 символов). "
+        "Стиль: космический ужас и древняя обречённость абсурдно сталкиваются с бытовой повседневностью, "
+        "мрачно, иронично и смешно. Соблюдай безупречную грамотность и орфографию. "
+        "Выведи только сам гороскоп, без вступлений, без комментариев, без разметки и строго без латинских букв."
+    )
+
+
+def split_message_by_blocks(text: str, max_len: int = 4050) -> list[str]:
+    """Разбивает длинный текст по границам блоков (знаков), не разрывая абзацы."""
+    blocks = [b.strip() for b in text.strip().split("\n\n") if b.strip()]
+    parts = []
+    current_part = ""
+
+    for block in blocks:
+        candidate = f"{current_part}\n\n{block}" if current_part else block
+        if len(candidate) <= max_len:
+            current_part = candidate
+        else:
+            if current_part:
+                parts.append(current_part)
+            current_part = block
+
+    if current_part:
+        parts.append(current_part)
+
+    return parts
+
+
+def generate() -> bool:
+    """Запрос к DeepSeek с контролем длины текста, сохранение в архив и pending."""
     logging.info("Режим generate: запрос к DeepSeek...")
-    try:
-        response = client.chat.completions.create(
-            model="deepseek-flash",
-            messages=[{"role": "user", "content": PROMPT}],
-            max_tokens=4000,
-            stream=False,
-            extra_body={"thinking": {"type": "disabled"}}
-        )
-        text = response.choices[0].message.content
-        if not text or not text.strip():
-            logging.error("DeepSeek вернул пустой ответ")
-            return False
+    prompt = build_prompt()
+    last_valid_text = ""
 
-        save_dir = "/home/skysmoker/horoscope-bot/horoscopes"
-        os.makedirs(save_dir, exist_ok=True)
-        filename = datetime.now().strftime("%d-%m-%Y-%H-%M") + ".txt"
-        filepath = os.path.join(save_dir, filename)
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(text)
-        logging.info(f"Сохранено в архив: {filepath}")
+    for attempt in range(1, 4):
+        try:
+            response = client.chat.completions.create(
+                model="deepseek-flash",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=4000,
+                stream=False,
+                extra_body={"thinking": {"type": "disabled"}}
+            )
+            text = (response.choices[0].message.content or "").strip()
+            if not text:
+                logging.error("DeepSeek вернул пустой ответ")
+                continue
 
-        with open(PENDING_FILE, "w", encoding="utf-8") as f:
-            f.write(text)
-        logging.info(f"Сохранено в обработку: {PENDING_FILE}")
+            last_valid_text = text
+            length = len(text)
+            logging.info(f"Попытка {attempt}/3: сгенерировано {length} символов.")
+
+            if 3300 <= length <= 4040 or attempt == 3:
+                ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+                filename = datetime.now().strftime("%d-%m-%Y-%H-%M") + ".txt"
+                filepath = ARCHIVE_DIR / filename
+                filepath.write_text(text + "\n", encoding="utf-8")
+                logging.info(f"Сохранено в архив: {filepath}")
+
+                PENDING_FILE.write_text(text + "\n", encoding="utf-8")
+                logging.info(f"Сохранено в обработку: {PENDING_FILE}")
+                return True
+
+            logging.warning(f"Длина {length} вне диапазона 3300–4040 символов, пробую перегенерировать...")
+
+        except Exception as e:
+            logging.error(f"Ошибка DeepSeek (попытка {attempt}/3): {e}")
+            if attempt < 3:
+                time.sleep(10)
+
+    if last_valid_text:
+        ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+        filepath = ARCHIVE_DIR / (datetime.now().strftime("%d-%m-%Y-%H-%M") + ".txt")
+        filepath.write_text(last_valid_text + "\n", encoding="utf-8")
+        PENDING_FILE.write_text(last_valid_text + "\n", encoding="utf-8")
         return True
-    except Exception as e:
-        logging.error(f"Ошибка DeepSeek: {e}")
-        return False
+
+    return False
 
 
-def send():
-    """Отправка pending-файла в Telegram. Если файла нет — генерирует его."""
-    if not os.path.exists(PENDING_FILE):
+def send() -> bool:
+    """Отправка pending-файла в Telegram простым текстом."""
+    if not PENDING_FILE.exists():
         logging.warning("Pending-файл не найден. Пробую сгенерировать заново...")
         if not generate():
             logging.error("Не удалось сгенерировать гороскоп. Отправка отменена.")
             return False
 
-    with open(PENDING_FILE, "r", encoding="utf-8") as f:
-        text = f.read()
-
+    text = PENDING_FILE.read_text(encoding="utf-8")
     if not text.strip():
         logging.error("Режим отправки: временный файл пустой")
         return False
 
-    max_len = 4050
-    if len(text) > max_len:
-        parts = [text[i:i+max_len] for i in range(0, len(text), max_len)]
-    else:
-        parts = [text]
-
+    parts = split_message_by_blocks(text, max_len=4050)
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     all_ok = True
+
     for part in parts:
         try:
-            resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": part})
+            resp = requests.post(
+                url,
+                data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": part
+                },
+                timeout=15
+            )
             if resp.status_code == 200:
                 logging.info("Отправлено успешно.")
             else:
-                logging.error(f"Telegram-ошибка: {resp.text}")
+                logging.error(f"Telegram-ошибка ({resp.status_code}): {resp.text}")
                 all_ok = False
         except Exception as e:
-            logging.error(f"Ошибка сети: {e}")
+            logging.error(f"Ошибка сети при отправке в Telegram: {e}")
             all_ok = False
 
     if all_ok:
-        sent_name = "/home/skysmoker/horoscope-bot/sent_" + datetime.now().strftime("%d-%m-%Y-%H-%M") + ".txt"
-        os.rename(PENDING_FILE, sent_name)
-        logging.info(f"Временный файл переименован в {sent_name}")
+        PENDING_FILE.unlink(missing_ok=True)
+        logging.info("Pending-файл успешно отправлен и удалён.")
+
     return all_ok
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "generate":
+    mode = sys.argv[1] if len(sys.argv) > 1 else "all"
+    if mode == "generate":
         generate()
-    elif len(sys.argv) > 1 and sys.argv[1] == "send":
+    elif mode == "send":
         send()
     else:
         if generate():
